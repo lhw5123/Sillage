@@ -74,7 +74,8 @@ pub struct Workspace {
     find_index: usize,
     transcript_scroll: ScrollHandle,
     sidebar_collapsed: bool,
-    /// The right panel stays closed until the user opens it.
+    /// Whether the right panel is showing. It starts on its chooser so the
+    /// surfaces are visible without hunting for them.
     preview_open: bool,
     run: Option<ActiveRun>,
     next_run_id: u64,
@@ -129,7 +130,10 @@ impl Workspace {
         let preview_path = projects
             .get(selected_project)
             .map(|project| project.path.clone());
-        preview.update(cx, |preview, cx| preview.set_workspace(preview_path, cx));
+        preview.update(cx, |preview, cx| {
+            preview.set_workspace(preview_path, cx);
+            preview.set_panel_visible(true, cx);
+        });
         let agents = agents::detect();
         let status = if agents.is_empty() {
             "No coding agents detected on PATH".into()
@@ -153,7 +157,7 @@ impl Workspace {
             find_index: 0,
             transcript_scroll: ScrollHandle::new(),
             sidebar_collapsed: false,
-            preview_open: false,
+            preview_open: true,
             run: None,
             next_run_id: 0,
             status,
@@ -606,8 +610,9 @@ impl Workspace {
         Some((self.selected_project, 0))
     }
 
-    /// Title-bar control that opens and closes the right panel.
-    fn render_preview_toggle(
+    /// Control at the top right of the main pane that opens and closes the
+    /// right panel.
+    pub(super) fn render_preview_toggle(
         &self,
         targets: &[HintTarget],
         cx: &Context<Self>,
@@ -625,24 +630,24 @@ impl Workspace {
             "Open the right panel"
         };
 
-        h_flex().pr_3().child(
-            div()
-                .relative()
-                .child(
-                    Button::new("toggle-preview")
-                        .ghost()
-                        .xsmall()
-                        .icon(icon)
-                        .tooltip(tooltip)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_preview(&TogglePreview, window, cx);
-                        })),
-                )
-                .when_some(hint, |this, label| {
-                    let active = label.starts_with(&typed);
-                    this.child(keys::hint_badge(&label, active, cx))
-                }),
-        )
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(
+                Button::new("toggle-preview")
+                    .ghost()
+                    .xsmall()
+                    .icon(icon)
+                    .accessibility_label("Toggle the right panel")
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_preview(&TogglePreview, window, cx);
+                    })),
+            )
+            .when_some(hint, |this, label| {
+                let active = label.starts_with(&typed);
+                this.child(keys::hint_badge(&label, active, cx))
+            })
     }
 
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
@@ -711,11 +716,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_preview))
             .on_action(cx.listener(Self::pick_workspace))
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                TitleBar::new()
-                    .child("Sillage")
-                    .child(self.render_preview_toggle(&targets, cx)),
-            )
+            .child(TitleBar::new().child("Sillage"))
             .when(self.searching, |this| {
                 this.child(self.render_global_search(cx))
             })

@@ -229,6 +229,8 @@ impl Workspace {
                 h_flex()
                     .px_5()
                     .py_3()
+                    .gap_2()
+                    .items_center()
                     .border_b_1()
                     .border_color(theme.border.opacity(0.5))
                     .child(
@@ -236,7 +238,9 @@ impl Workspace {
                             .text_sm()
                             .text_color(theme.muted_foreground)
                             .child("New task"),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .child(self.render_preview_toggle(targets, cx)),
             )
             .child(
                 v_flex()
@@ -355,7 +359,8 @@ impl Workspace {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(format_relative_time(item.created_at)),
-                            ),
+                            )
+                            .child(self.render_preview_toggle(targets, cx)),
                     )
                     .when_some(project_name, |this, name| {
                         this.child(
