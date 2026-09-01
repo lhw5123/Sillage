@@ -574,7 +574,7 @@ fn collect_files(root: &Path, directory: &Path, files: &mut Vec<WorkspaceFile>) 
 
 fn changed_paths(root: &Path) -> HashSet<String> {
     let Ok(output) = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(root)
         .output()
     else {
@@ -583,11 +583,29 @@ fn changed_paths(root: &Path) -> HashSet<String> {
     if !output.status.success() {
         return HashSet::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).to_string())
-        .collect()
+    parse_changed_paths(&output.stdout)
+}
+
+fn parse_changed_paths(output: &[u8]) -> HashSet<String> {
+    let entries: Vec<_> = output.split(|byte| *byte == 0).collect();
+    let mut paths = HashSet::new();
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        if entry.len() < 4 {
+            index += 1;
+            continue;
+        }
+        let status = &entry[..2];
+        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+        paths.insert(path);
+        index += if status.contains(&b'R') || status.contains(&b'C') {
+            2
+        } else {
+            1
+        };
+    }
+    paths
 }
 
 fn read_preview(path: &Path) -> String {
@@ -640,5 +658,13 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative, "src/main.rs");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn porcelain_paths_keep_spaces_and_rename_destination() {
+        let paths = parse_changed_paths(b"M  src/file name.rs\0R  src/new.rs\0src/old.rs\0");
+        assert!(paths.contains("src/file name.rs"));
+        assert!(paths.contains("src/new.rs"));
+        assert!(!paths.contains("src/old.rs"));
     }
 }

@@ -661,19 +661,21 @@ impl Render for Workspace {
                     .min_h_0()
                     .child(self.render_sidebar(&targets, cx))
                     .child(
-                        h_resizable("chat-preview")
-                            .child(
-                                resizable_panel()
-                                    .size_range(px(360.)..gpui::Pixels::MAX)
-                                    .child(self.render_main(&targets, cx)),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .flex_none()
-                                    .size(px(460.))
-                                    .size_range(px(320.)..px(760.))
-                                    .child(self.preview.clone()),
-                            ),
+                        div().flex_1().min_w_0().h_full().child(
+                            h_resizable("chat-preview")
+                                .child(
+                                    resizable_panel()
+                                        .size_range(px(320.)..gpui::Pixels::MAX)
+                                        .child(self.render_main(&targets, cx)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .flex_none()
+                                        .size(px(460.))
+                                        .size_range(px(300.)..px(760.))
+                                        .child(self.preview.clone()),
+                                ),
+                        ),
                     ),
             )
             .child(self.render_status_bar(cx))
