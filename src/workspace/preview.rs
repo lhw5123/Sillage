@@ -1,4 +1,7 @@
-//! Resizable workspace preview for files, command output, and web pages.
+//! Resizable workspace preview for web pages, shell output, files, and changes.
+//!
+//! The panel opens on a chooser, so what it shows is always a surface the user
+//! picked. Every surface reads from the workspace selected in the sidebar.
 
 use std::collections::HashSet;
 use std::fs;
@@ -23,12 +26,72 @@ use raw_window_handle::HasWindowHandle as _;
 
 const MAX_FILES: usize = 1_000;
 const MAX_PREVIEW_BYTES: u64 = 1_000_000;
+/// A long diff stops here so one large change cannot stall the panel.
+const MAX_DIFF_LINES: usize = 1_500;
 
+/// One thing the panel can show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreviewTab {
-    File,
-    Terminal,
+enum Surface {
     Browser,
+    Terminal,
+    Files,
+    Review,
+}
+
+/// Chooser order, which is also the order the 2x2 grid paints.
+const SURFACES: [Surface; 4] = [
+    Surface::Browser,
+    Surface::Terminal,
+    Surface::Files,
+    Surface::Review,
+];
+
+impl Surface {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Browser => "surface-browser",
+            Self::Terminal => "surface-terminal",
+            Self::Files => "surface-files",
+            Self::Review => "surface-review",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Browser => "Browser",
+            Self::Terminal => "Terminal",
+            Self::Files => "Files",
+            Self::Review => "Review",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Browser => "Open a local app or URL",
+            Self::Terminal => "Start a shell in this workspace",
+            Self::Files => "Browse and read workspace files",
+            Self::Review => "Review file changes",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Browser => IconName::Globe,
+            Self::Terminal => IconName::SquareTerminal,
+            Self::Files => IconName::Folder,
+            Self::Review => IconName::File,
+        }
+    }
+}
+
+/// How one diff line is painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLine {
+    Added,
+    Removed,
+    Hunk,
+    Meta,
+    Context,
 }
 
 #[derive(Debug, Clone)]
@@ -40,10 +103,15 @@ struct WorkspaceFile {
 
 pub(super) struct PreviewPane {
     workspace: Option<PathBuf>,
-    tab: PreviewTab,
+    /// `None` shows the chooser rather than a surface.
+    surface: Option<Surface>,
+    /// Whether the workspace is showing the panel at all; a hidden panel also
+    /// hides the browser, which is a native view painted over the window.
+    panel_visible: bool,
     files: Vec<WorkspaceFile>,
     selected_file: Option<PathBuf>,
     file_content: SharedString,
+    review: SharedString,
     terminal_input: Entity<InputState>,
     terminal_output: SharedString,
     terminal_running: bool,
@@ -91,10 +159,12 @@ impl PreviewPane {
 
         Self {
             workspace: None,
-            tab: PreviewTab::File,
+            surface: None,
+            panel_visible: false,
             files: Vec::new(),
             selected_file: None,
             file_content: "Choose a file from the workspace.".into(),
+            review: "No changes since the last commit.".into(),
             terminal_input,
             terminal_output: "Commands run in the selected workspace.\n".into(),
             terminal_running: false,
@@ -116,28 +186,53 @@ impl PreviewPane {
         self.refresh(cx);
     }
 
+    /// Follow the workspace panel's own visibility so the native browser view
+    /// never paints over a closed panel.
+    pub(super) fn set_panel_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.panel_visible = visible;
+        self.sync_webview(cx);
+        cx.notify();
+    }
+
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.files = self
             .workspace
             .as_deref()
             .map(workspace_files)
             .unwrap_or_default();
+        self.review = self
+            .workspace
+            .as_deref()
+            .map(review_text)
+            .unwrap_or_else(|| "Choose a workspace to review changes.".to_string())
+            .into();
         if let Some(path) = self.selected_file.clone() {
             self.read_file(path);
         }
         cx.notify();
     }
 
-    fn select_tab(&mut self, tab: PreviewTab, cx: &mut Context<Self>) {
-        self.tab = tab;
+    fn open_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
+        self.surface = Some(surface);
+        self.sync_webview(cx);
+        cx.notify();
+    }
+
+    fn show_chooser(&mut self, cx: &mut Context<Self>) {
+        self.surface = None;
+        self.sync_webview(cx);
+        cx.notify();
+    }
+
+    fn sync_webview(&self, cx: &mut Context<Self>) {
+        let visible = self.panel_visible && self.surface == Some(Surface::Browser);
         self.webview.update(cx, |webview, _| {
-            if tab == PreviewTab::Browser {
+            if visible {
                 webview.show();
             } else {
                 webview.hide();
             }
         });
-        cx.notify();
     }
 
     fn read_file(&mut self, path: PathBuf) {
@@ -147,7 +242,7 @@ impl PreviewPane {
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.read_file(path);
-        self.select_tab(PreviewTab::File, cx);
+        self.open_surface(Surface::Files, cx);
     }
 
     fn preview_in_browser(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -156,7 +251,7 @@ impl PreviewPane {
         self.address_input.update(cx, |input, cx| {
             input.set_value(url, window, cx);
         });
-        self.select_tab(PreviewTab::Browser, cx);
+        self.open_surface(Surface::Browser, cx);
     }
 
     fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -214,24 +309,72 @@ impl PreviewPane {
         cx.notify();
     }
 
-    fn render_tab(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        icon: IconName,
-        tab: PreviewTab,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        Button::new(id)
-            .ghost()
-            .xsmall()
-            .icon(icon)
-            .label(label)
-            .when(self.tab == tab, |button| button.primary())
-            .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+    /// The 2x2 grid the panel opens on.
+    fn render_chooser(&self, cx: &Context<Self>) -> impl IntoElement {
+        let muted_foreground = cx.theme().muted_foreground;
+        let rows: Vec<_> = SURFACES
+            .chunks(2)
+            .map(|pair| {
+                h_flex().gap_2().children(
+                    pair.iter()
+                        .map(|surface| self.render_surface_card(*surface, cx)),
+                )
+            })
+            .collect();
+
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(div().text_sm().child("Open a surface"))
+            .child(
+                div()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child("Choose what to show in the right panel"),
+            )
+            .children(rows)
     }
 
-    fn render_file_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_surface_card(&self, surface: Surface, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let radius = theme.radius_lg;
+        let border = theme.border;
+        let muted = theme.muted;
+        let muted_foreground = theme.muted_foreground;
+
+        div()
+            .id(surface.id())
+            .w(px(146.))
+            .p_3()
+            .rounded(radius)
+            .border_1()
+            .border_color(border)
+            .bg(muted.opacity(0.2))
+            .cursor_pointer()
+            .hover(move |card| card.bg(muted.opacity(0.45)))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_surface(surface, cx)))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(surface.icon())
+                            .size(px(14.))
+                            .text_color(muted_foreground),
+                    )
+                    .child(div().text_sm().child(surface.label()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child(surface.description()),
+                    ),
+            )
+    }
+
+    fn render_files_surface(&self, cx: &Context<Self>) -> impl IntoElement {
         let artifacts: Vec<_> = self
             .files
             .iter()
@@ -324,7 +467,7 @@ impl PreviewPane {
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Globe)
-                                        .tooltip("Open in Browser preview")
+                                        .tooltip("Open in Browser")
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.preview_in_browser(path.clone(), window, cx);
                                         })),
@@ -350,7 +493,7 @@ impl PreviewPane {
         &self,
         label: &'static str,
         files: Vec<WorkspaceFile>,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let hover = cx.theme().muted;
@@ -391,7 +534,47 @@ impl PreviewPane {
             .into_any_element()
     }
 
-    fn render_terminal_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_review_surface(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let added = theme.green;
+        let removed = theme.red;
+        let hunk = theme.blue;
+        let meta = theme.muted_foreground;
+        let context = theme.foreground.opacity(0.85);
+        let mono_font = theme.mono_font_family.clone();
+
+        let lines: Vec<_> = self
+            .review
+            .lines()
+            .map(|line| {
+                let color = match classify_diff_line(line) {
+                    DiffLine::Added => added,
+                    DiffLine::Removed => removed,
+                    DiffLine::Hunk => hunk,
+                    DiffLine::Meta => meta,
+                    DiffLine::Context => context,
+                };
+                let text = if line.is_empty() { " " } else { line };
+                div()
+                    .w_full()
+                    .text_color(color)
+                    .child(text.to_string())
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("preview-review")
+            .size_full()
+            .p_3()
+            .overflow_scroll()
+            .font_family(mono_font)
+            .text_xs()
+            .line_height(px(18.))
+            .child(v_flex().w_full().children(lines))
+    }
+
+    fn render_terminal_surface(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -433,7 +616,7 @@ impl PreviewPane {
             )
     }
 
-    fn render_browser_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_browser_surface(&self, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .child(
@@ -449,68 +632,67 @@ impl PreviewPane {
             )
             .child(div().flex_1().min_h_0().child(self.webview.clone()))
     }
+
+    /// Surface title, the way back to the chooser, and a refresh for the
+    /// surfaces that read from disk.
+    fn render_header(&self, surface: Surface, cx: &Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let reads_disk = matches!(surface, Surface::Files | Surface::Review);
+
+        h_flex()
+            .h(px(38.))
+            .px_2()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Button::new("preview-surfaces")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronLeft)
+                    .tooltip("All surfaces")
+                    .on_click(cx.listener(|this, _, _, cx| this.show_chooser(cx))),
+            )
+            .child(div().text_sm().child(surface.label()))
+            .child(div().flex_1())
+            .when(reads_disk, |this| {
+                this.child(
+                    Button::new("preview-refresh")
+                        .ghost()
+                        .xsmall()
+                        .label("Refresh")
+                        .tooltip("Read the workspace again")
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                )
+            })
+    }
 }
 
 impl Render for PreviewPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.webview.update(cx, |webview, _| {
-            if self.tab == PreviewTab::Browser {
-                webview.show();
-            } else {
-                webview.hide();
-            }
-        });
         let theme = cx.theme();
+        let border = theme.border;
+        let background = theme.background;
+
         v_flex()
             .size_full()
             .min_w_0()
             .border_l_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .child(
-                h_flex()
-                    .h(px(38.))
-                    .px_2()
-                    .gap_1()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(self.render_tab(
-                        "preview-file",
-                        "File",
-                        IconName::File,
-                        PreviewTab::File,
-                        cx,
-                    ))
-                    .child(self.render_tab(
-                        "preview-terminal",
-                        "Terminal",
-                        IconName::SquareTerminal,
-                        PreviewTab::Terminal,
-                        cx,
-                    ))
-                    .child(self.render_tab(
-                        "preview-browser",
-                        "Browser",
-                        IconName::Globe,
-                        PreviewTab::Browser,
-                        cx,
-                    ))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("refresh-preview")
-                            .ghost()
-                            .xsmall()
-                            .label("Refresh")
-                            .tooltip("Refresh workspace files")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().child(match self.tab {
-                PreviewTab::File => self.render_file_tab(cx).into_any_element(),
-                PreviewTab::Terminal => self.render_terminal_tab(cx).into_any_element(),
-                PreviewTab::Browser => self.render_browser_tab(cx).into_any_element(),
-            }))
+            .border_color(border)
+            .bg(background)
+            .when_some(self.surface, |this, surface| {
+                this.child(self.render_header(surface, cx))
+                    .child(div().flex_1().min_h_0().child(match surface {
+                        Surface::Browser => self.render_browser_surface(cx).into_any_element(),
+                        Surface::Terminal => self.render_terminal_surface(cx).into_any_element(),
+                        Surface::Files => self.render_files_surface(cx).into_any_element(),
+                        Surface::Review => self.render_review_surface(cx).into_any_element(),
+                    }))
+            })
+            .when(self.surface.is_none(), |this| {
+                this.child(div().flex_1().min_h_0().child(self.render_chooser(cx)))
+            })
     }
 }
 
@@ -519,6 +701,22 @@ fn normalize_url(value: &str) -> String {
         value.to_string()
     } else {
         format!("http://{value}")
+    }
+}
+
+fn classify_diff_line(line: &str) -> DiffLine {
+    if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff --git") {
+        DiffLine::Meta
+    } else if line.starts_with("index ") || line.starts_with("new file") {
+        DiffLine::Meta
+    } else if line.starts_with("@@") {
+        DiffLine::Hunk
+    } else if line.starts_with('+') {
+        DiffLine::Added
+    } else if line.starts_with('-') {
+        DiffLine::Removed
+    } else {
+        DiffLine::Context
     }
 }
 
@@ -608,6 +806,68 @@ fn parse_changed_paths(output: &[u8]) -> HashSet<String> {
     paths
 }
 
+/// Tracked changes as a diff, with untracked files listed after them since a
+/// diff against HEAD cannot show a file Git has never seen.
+fn review_text(root: &Path) -> String {
+    let Ok(diff) = Command::new("git")
+        .args(["--no-pager", "diff", "--no-color", "HEAD"])
+        .current_dir(root)
+        .output()
+    else {
+        return "Git is unavailable on this machine.".to_string();
+    };
+    if !diff.status.success() {
+        return "This folder has no Git history to review.".to_string();
+    }
+
+    let mut text = String::from_utf8_lossy(&diff.stdout).into_owned();
+    let untracked = untracked_files(root);
+    if !untracked.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("\nUntracked files:\n");
+        for path in untracked {
+            text.push_str(&format!("+ {path}\n"));
+        }
+    }
+    if text.trim().is_empty() {
+        return "No changes since the last commit.".to_string();
+    }
+    truncate_diff(&text)
+}
+
+fn untracked_files(root: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect()
+}
+
+fn truncate_diff(text: &str) -> String {
+    let mut out: String = text
+        .lines()
+        .take(MAX_DIFF_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.lines().count() > MAX_DIFF_LINES {
+        out.push_str(&format!("\n… diff cut off at {MAX_DIFF_LINES} lines"));
+    }
+    out
+}
+
 fn read_preview(path: &Path) -> String {
     let Ok(metadata) = fs::metadata(path) else {
         return "The file is unavailable.".to_string();
@@ -666,5 +926,23 @@ mod tests {
         assert!(paths.contains("src/file name.rs"));
         assert!(paths.contains("src/new.rs"));
         assert!(!paths.contains("src/old.rs"));
+    }
+
+    #[test]
+    fn diff_headers_read_as_metadata_rather_than_edits() {
+        assert_eq!(classify_diff_line("--- a/src/main.rs"), DiffLine::Meta);
+        assert_eq!(classify_diff_line("+++ b/src/main.rs"), DiffLine::Meta);
+        assert_eq!(classify_diff_line("@@ -1,4 +1,6 @@"), DiffLine::Hunk);
+        assert_eq!(classify_diff_line("+let value = 1;"), DiffLine::Added);
+        assert_eq!(classify_diff_line("-let value = 0;"), DiffLine::Removed);
+        assert_eq!(classify_diff_line(" unchanged"), DiffLine::Context);
+    }
+
+    #[test]
+    fn a_long_diff_is_cut_off_with_a_note() {
+        let long = "+line\n".repeat(MAX_DIFF_LINES + 50);
+        let out = truncate_diff(&long);
+        assert_eq!(out.lines().count(), MAX_DIFF_LINES + 1);
+        assert!(out.ends_with(&format!("… diff cut off at {MAX_DIFF_LINES} lines")));
     }
 }
