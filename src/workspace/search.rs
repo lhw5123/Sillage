@@ -143,6 +143,7 @@ impl Workspace {
             }
             _ => Screen::NewTask,
         };
+        self.sync_preview_workspace(cx);
         self.close_search(window, cx);
     }
 

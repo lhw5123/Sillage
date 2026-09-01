@@ -353,6 +353,7 @@ impl Workspace {
                             project: project_index,
                             task: task_index,
                         };
+                        this.sync_preview_workspace(cx);
                         cx.notify();
                     }))
                     .child(
