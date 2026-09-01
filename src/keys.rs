@@ -22,6 +22,7 @@ actions!(
         FindNext,
         FindPrevious,
         ToggleSidebar,
+        TogglePreview,
         PickWorkspace
     ]
 );
@@ -61,12 +62,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-g", FindPrevious, Some(COMMAND)),
         KeyBinding::new("shift-enter", FindPrevious, Some(WORKSPACE)),
         KeyBinding::new("cmd-b", ToggleSidebar, Some(WORKSPACE)),
+        KeyBinding::new("cmd-r", TogglePreview, Some(WORKSPACE)),
+        KeyBinding::new("cmd-r", TogglePreview, Some(COMMAND)),
         KeyBinding::new("cmd-o", PickWorkspace, Some(WORKSPACE)),
         KeyBinding::new("i", EnterInsert, Some(COMMAND)),
         KeyBinding::new("f", ShowHints, Some(COMMAND)),
         KeyBinding::new("/", FocusSearch, Some(COMMAND)),
         KeyBinding::new("n", StartNewTask, Some(COMMAND)),
         KeyBinding::new("b", ToggleSidebar, Some(COMMAND)),
+        KeyBinding::new("r", TogglePreview, Some(COMMAND)),
         KeyBinding::new("o", PickWorkspace, Some(COMMAND)),
     ]);
 }
@@ -104,6 +108,7 @@ pub enum HintAction {
     NewTask,
     Search,
     ToggleSidebar,
+    TogglePreview,
     CycleAgent,
     ToggleAccess,
     PickWorkspace,

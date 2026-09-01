@@ -6,6 +6,7 @@
 //! module.
 
 mod pane;
+mod preview;
 mod search;
 mod sidebar;
 
@@ -18,15 +19,21 @@ use gpui::{
     SharedString, Styled, Subscription, Window, div, px,
 };
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::{ActiveTheme as _, Root, TitleBar, WindowExt, h_flex, v_flex};
+use gpui_component::resizable::{h_resizable, resizable_panel};
+use gpui_component::{
+    ActiveTheme as _, IconName, Root, Sizable as _, TitleBar, WindowExt,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
+};
 
 use crate::agents::{self, AgentKind, DetectedAgent, RunHandle, RunOutcome};
 use crate::keys::{
     self, CancelTask, CommandState, EnterInsert, FindNext, FindPrevious, FocusSearch, HandleEscape,
     HintAction, HintTarget, Mode, PickWorkspace, ShowHints, StartNewTask, SubmitTask,
-    ToggleSidebar,
+    TogglePreview, ToggleSidebar,
 };
 use crate::projects::{self, Project, Task, title_from_prompt};
+use preview::PreviewPane;
 
 pub fn init(cx: &mut App) {
     keys::bind_keys(cx);
@@ -67,11 +74,15 @@ pub struct Workspace {
     find_index: usize,
     transcript_scroll: ScrollHandle,
     sidebar_collapsed: bool,
+    /// Whether the right panel is showing. It starts on its chooser so the
+    /// surfaces are visible without hunting for them.
+    preview_open: bool,
     run: Option<ActiveRun>,
     next_run_id: u64,
     status: SharedString,
     prompt: Entity<InputState>,
     search: Entity<InputState>,
+    preview: Entity<PreviewPane>,
     command: CommandState,
     _subscriptions: Vec<Subscription>,
 }
@@ -115,6 +126,14 @@ impl Workspace {
 
         let projects = projects::scan();
         let selected_project = 0;
+        let preview = cx.new(|cx| PreviewPane::new(window, cx));
+        let preview_path = projects
+            .get(selected_project)
+            .map(|project| project.path.clone());
+        preview.update(cx, |preview, cx| {
+            preview.set_workspace(preview_path, cx);
+            preview.set_panel_visible(true, cx);
+        });
         let agents = agents::detect();
         let status = if agents.is_empty() {
             "No coding agents detected on PATH".into()
@@ -138,11 +157,13 @@ impl Workspace {
             find_index: 0,
             transcript_scroll: ScrollHandle::new(),
             sidebar_collapsed: false,
+            preview_open: true,
             run: None,
             next_run_id: 0,
             status,
             prompt,
             search,
+            preview,
             command: CommandState::new(),
             _subscriptions,
         }
@@ -158,6 +179,12 @@ impl Workspace {
 
     fn current_project(&self) -> Option<&Project> {
         self.projects.get(self.selected_project)
+    }
+
+    fn sync_preview_workspace(&self, cx: &mut Context<Self>) {
+        let path = self.current_project().map(|project| project.path.clone());
+        self.preview
+            .update(cx, |preview, cx| preview.set_workspace(path, cx));
     }
 
     fn filtered_indices(&self, cx: &App) -> Vec<usize> {
@@ -214,6 +241,7 @@ impl Workspace {
         }
         self.selected_project = index;
         self.screen = Screen::NewTask;
+        self.sync_preview_workspace(cx);
         cx.notify();
     }
 
@@ -241,6 +269,17 @@ impl Workspace {
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    fn toggle_preview(&mut self, _: &TogglePreview, _: &mut Window, cx: &mut Context<Self>) {
+        self.preview_open = !self.preview_open;
+        let open = self.preview_open;
+        self.preview
+            .update(cx, |preview, cx| preview.set_panel_visible(open, cx));
+        if open {
+            self.sync_preview_workspace(cx);
+        }
         cx.notify();
     }
 
@@ -300,6 +339,7 @@ impl Workspace {
         if let Some(project) = self.current_project() {
             self.status = format!("Workspace {}", project.name).into();
         }
+        self.sync_preview_workspace(cx);
         cx.notify();
     }
 
@@ -339,6 +379,7 @@ impl Workspace {
             HintAction::NewTask,
             HintAction::Search,
             HintAction::ToggleSidebar,
+            HintAction::TogglePreview,
         ];
         if !self.sidebar_collapsed {
             for index in self.filtered_indices(cx) {
@@ -380,6 +421,7 @@ impl Workspace {
             HintAction::NewTask => self.start_new_task(&StartNewTask, window, cx),
             HintAction::Search => self.focus_search(&FocusSearch, window, cx),
             HintAction::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
+            HintAction::TogglePreview => self.toggle_preview(&TogglePreview, window, cx),
             HintAction::CycleAgent => self.cycle_agent(cx),
             HintAction::ToggleAccess => {
                 self.full_access = !self.full_access;
@@ -398,6 +440,7 @@ impl Workspace {
                 self.selected_project = project;
                 self.screen = Screen::Task { project, task };
                 self.command.enter_insert();
+                self.sync_preview_workspace(cx);
                 cx.notify();
             }
             HintAction::ExpandProject { index } => {
@@ -539,6 +582,7 @@ impl Workspace {
             turn.output = output;
         }
         self.status = status.into();
+        self.preview.update(cx, |preview, cx| preview.refresh(cx));
         cx.notify();
     }
 
@@ -564,6 +608,46 @@ impl Workspace {
         );
         project.tasks.insert(0, task);
         Some((self.selected_project, 0))
+    }
+
+    /// Control at the top right of the main pane that opens and closes the
+    /// right panel.
+    pub(super) fn render_preview_toggle(
+        &self,
+        targets: &[HintTarget],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let typed = self.command.mode.typed_hint().to_string();
+        let hint = self.hint_label(HintAction::TogglePreview, targets);
+        let icon = if self.preview_open {
+            IconName::PanelRightClose
+        } else {
+            IconName::PanelRightOpen
+        };
+        let tooltip = if self.preview_open {
+            "Close the right panel"
+        } else {
+            "Open the right panel"
+        };
+
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(
+                Button::new("toggle-preview")
+                    .ghost()
+                    .xsmall()
+                    .icon(icon)
+                    .accessibility_label("Toggle the right panel")
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_preview(&TogglePreview, window, cx);
+                    })),
+            )
+            .when_some(hint, |this, label| {
+                let active = label.starts_with(&typed);
+                this.child(keys::hint_badge(&label, active, cx))
+            })
     }
 
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
@@ -629,6 +713,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_preview))
             .on_action(cx.listener(Self::pick_workspace))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(TitleBar::new().child("Sillage"))
@@ -640,7 +725,24 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(&targets, cx))
-                    .child(self.render_main(&targets, cx)),
+                    .child(
+                        div().flex_1().min_w_0().h_full().child(
+                            h_resizable("chat-preview")
+                                .child(
+                                    resizable_panel()
+                                        .size_range(px(320.)..gpui::Pixels::MAX)
+                                        .child(self.render_main(&targets, cx)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .visible(self.preview_open)
+                                        .flex_none()
+                                        .size(px(460.))
+                                        .size_range(px(300.)..px(760.))
+                                        .child(self.preview.clone()),
+                                ),
+                        ),
+                    ),
             )
             .child(self.render_status_bar(cx))
             .children(Root::render_notification_layer(window, cx))
